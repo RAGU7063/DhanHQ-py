@@ -460,6 +460,55 @@ except Exception as e:
 
 ```
 
+### ICT Judas Swing (Morning Trap) Strategy - Indicator & Backtest
+
+`dhanhq.strategies` ships a research-only ICT **Judas Swing** indicator and a date-range backtester
+built on the historical candle API (it never places orders).
+
+**Logic (5-minute candles, IST):** in the first 15-30 minutes after the 09:15 open, price makes a *false*
+move to sweep the stop losses beyond the Previous Day High / Low (PDH / PDL) or the Opening Range
+High / Low (ORH / ORL). As soon as a single 5-minute reversal candle closes back inside the swept level,
+the real move begins in the opposite direction.
+
+* **Bullish trap:** price drops after open, takes out PDL / ORL, a green 5-min candle closes back above the
+  level -> go long at the next candle open. Stop = sweep low - buffer, target = fixed points (Nifty 30-50).
+* **Bearish trap:** mirror image (sweep PDH / ORH, red reversal candle, short).
+
+```python
+from dhanhq import DhanContext, dhanhq
+from dhanhq.strategies import JudasSwingBacktester, JudasSwingConfig, JudasSwingIndicator, NIFTY_50
+
+dhan = dhanhq(DhanContext("client_id", "access_token"))
+
+config = JudasSwingConfig(
+    target_points=40,          # Nifty quick scalp: 30-50 points
+    stop_buffer_points=5,      # stop sits 5 points beyond the sweep extreme
+    judas_window_minutes=30,   # the sweep must start between 09:15 and 09:45
+    opening_range_minutes=15,  # ORH / ORL = first 15 minutes
+    direction="both",          # "long" (classic bullish trap), "short" or "both"
+)
+
+# Backtest by date range - candles are fetched from Dhan (5-min, NIFTY 50 index = security id 13)
+bt = JudasSwingBacktester(dhan, **NIFTY_50, config=config)
+result = bt.run("2025-08-01", "2025-09-30")
+print(result.summary())      # win rate, points, profit factor, drawdown ...
+print(result.trades)         # one row per trade: sweep, reversal, entry, stop, target, exit
+result.trades.to_csv("judas_trades.csv", index=False)
+
+# Indicator only (per-candle levels + flags, for charting / live use)
+candles = bt.fetch("2025-09-25", "2025-09-30")
+ind = JudasSwingIndicator(config).compute(candles)       # pdh, pdl, orh, orl, sweep_low/high, long/short_entry
+signals = JudasSwingIndicator(config).signals(candles)   # list of JudasSignal (max one per day)
+```
+
+Or from the command line (credentials via `CLIENT_ID` / `ACCESS_TOKEN` env vars or flags):
+
+```bash
+python examples/judas_swing_backtest.py --from-date 2025-08-01 --to-date 2025-09-30
+python examples/judas_swing_backtest.py --from-date 2025-09-01 --to-date 2025-09-30 --symbol BANKNIFTY --direction long --target 50
+python examples/judas_swing_backtest.py --csv nifty_5min.csv --from-date 2025-09-01 --to-date 2025-09-30   # offline, no API
+```
+
 ## Changelog
 
 [Check release notes](https://github.com/dhan-oss/DhanHQ-py/releases)
