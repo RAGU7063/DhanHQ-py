@@ -1,0 +1,310 @@
+//@version=5
+// ICT Judas Swing (Morning Trap) - NSE / Nifty
+// ---------------------------------------------------------------------------------------
+// Use on a 5-minute chart (NSE:NIFTY, NSE:BANKNIFTY, any NSE stock).
+//
+// Logic (same as dhanhq.strategies.judas_swing):
+//   1. 09:15 open. Inside the first N minutes (Judas window) price makes a fake move and
+//      sweeps liquidity: Previous Day Low / Opening-Range Low (bullish trap) or
+//      Previous Day High / Opening-Range High (bearish trap).
+//   2. A single candle closes back inside the swept level (green for long, red for short).
+//   3. Entry at the open of the next candle. Stop = sweep extreme +/- buffer.
+//      Target = fixed points (Nifty 30-50). Time exit if nothing is hit.
+//   One trade per day. Built-in bar-by-bar backtest stats are shown in a table.
+// ---------------------------------------------------------------------------------------
+indicator("ICT Judas Swing (Morning Trap) - NSE", shorttitle = "Judas Swing", overlay = true,
+     max_labels_count = 500, max_lines_count = 500)
+
+// ---------------- Inputs ----------------
+grpS = "Setup (minutes are counted from the 09:15 open)"
+windowMin = input.int(30,  "Judas window: sweep must start within (min)", minval = 5,  maxval = 120, group = grpS)
+orMin     = input.int(15,  "Opening range length (min)",                  minval = 5,  maxval = 60,  group = grpS)
+revMax    = input.int(3,   "Reversal candle within N candles of sweep",   minval = 1,  maxval = 10,  group = grpS)
+cutoffMin = input.int(60,  "No new entry after (min)  [60 = 10:15]",      minval = 5,  maxval = 360, group = grpS)
+exitMin   = input.int(360, "Time exit at (min)  [360 = 15:15]",           minval = 30, maxval = 375, group = grpS)
+dirOpt    = input.string("Both", "Direction", options = ["Long", "Short", "Both"], group = grpS)
+usePD     = input.bool(true, "Use Previous Day High / Low (PDH / PDL)", group = grpS)
+useOR     = input.bool(true, "Use Opening Range High / Low (ORH / ORL)", group = grpS)
+
+grpR = "Risk"
+targetPts = input.float(40, "Target (points)",                       minval = 1, step = 5, group = grpR)
+slBuffer  = input.float(5,  "Stop buffer beyond sweep (points)",     minval = 0, step = 1, group = grpR)
+maxStop   = input.float(60, "Max risk per trade (points, 0 = off)", minval = 0, step = 5, group = grpR)
+
+grpV = "Display"
+showLevels = input.bool(true, "Show PDH / PDL / ORH / ORL", group = grpV)
+showWindow = input.bool(true, "Shade Judas window",         group = grpV)
+showStats  = input.bool(true, "Show backtest table",        group = grpV)
+
+// ---------------- Session / day state ----------------
+newDay    = ta.change(time("D")) != 0
+tfMin     = timeframe.in_seconds() / 60.0
+var float dayStart = na
+var float dayOpen  = na
+if newDay
+    dayStart := time
+    dayOpen  := open
+sinceOpen = (time - dayStart) / 60000.0          // minutes from the first bar of the day
+inWindow  = sinceOpen < windowMin
+lastBar   = session.islastbar_regular or (sinceOpen + tfMin >= 375)
+
+// Previous day high / low (completed daily candle, no repaint)
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_on)
+
+// Opening range
+var float orH = na
+var float orL = na
+if newDay
+    orH := high
+    orL := low
+else if sinceOpen < orMin
+    orH := math.max(orH, high)
+    orL := math.min(orL, low)
+orReady = sinceOpen >= orMin
+
+// ---------------- Strategy state ----------------
+var int    pos         = 0          // 1 = long, -1 = short, 0 = flat
+var float  entryP      = na
+var float  stopP       = na
+var float  tgtP        = na
+var string entryLvl    = ""
+var bool   tradedToday = false
+
+var bool   pendLong    = false      // signal fired on previous bar -> enter at this bar's open
+var bool   pendShort   = false
+var float  pendStop    = na
+var string pendLvl     = ""
+
+var bool   swLow       = false      // active bullish sweep (low side)
+var float  swLowLvl    = na
+var float  swLowExt    = na
+var int    swLowBar    = na
+var string swLowName   = ""
+
+var bool   swHigh      = false      // active bearish sweep (high side)
+var float  swHighLvl   = na
+var float  swHighExt   = na
+var int    swHighBar   = na
+var string swHighName  = ""
+
+// Backtest stats
+var int   nTrades   = 0
+var int   nWins     = 0
+var int   nLong     = 0
+var int   nShort    = 0
+var float totalPts  = 0.0
+var float grossWin  = 0.0
+var float grossLoss = 0.0
+var float eqPeak    = 0.0
+var float maxDD     = 0.0
+
+if newDay
+    tradedToday := false
+    pendLong    := false
+    pendShort   := false
+    swLow       := false
+    swHigh      := false
+
+canLong  = dirOpt != "Short"
+canShort = dirOpt != "Long"
+
+// ---------------- 1. Pending entry -> fill at this bar's open ----------------
+bool longEntry  = false
+bool shortEntry = false
+if pendLong and not newDay and pos == 0 and not tradedToday
+    risk = open - pendStop
+    if sinceOpen < cutoffMin and (maxStop == 0 or risk <= maxStop)
+        pos         := 1
+        entryP      := open
+        stopP       := pendStop
+        tgtP        := open + targetPts
+        entryLvl    := pendLvl
+        tradedToday := true
+        longEntry   := true
+    pendLong := false
+if pendShort and not newDay and pos == 0 and not tradedToday
+    risk = pendStop - open
+    if sinceOpen < cutoffMin and (maxStop == 0 or risk <= maxStop)
+        pos         := -1
+        entryP      := open
+        stopP       := pendStop
+        tgtP        := open - targetPts
+        entryLvl    := pendLvl
+        tradedToday := true
+        shortEntry  := true
+    pendShort := false
+
+// ---------------- 2. Manage open position (stop checked before target) ----------------
+string exitReason = ""
+float  exitPrice  = na
+if pos == 1
+    if low <= stopP
+        exitPrice  := stopP
+        exitReason := "STOP"
+    else if high >= tgtP
+        exitPrice  := tgtP
+        exitReason := "TARGET"
+    else if sinceOpen >= exitMin or lastBar
+        exitPrice  := close
+        exitReason := "TIME"
+else if pos == -1
+    if high >= stopP
+        exitPrice  := stopP
+        exitReason := "STOP"
+    else if low <= tgtP
+        exitPrice  := tgtP
+        exitReason := "TARGET"
+    else if sinceOpen >= exitMin or lastBar
+        exitPrice  := close
+        exitReason := "TIME"
+
+float pnl = na
+if exitReason != ""
+    pnl := pos == 1 ? exitPrice - entryP : entryP - exitPrice
+    nTrades   += 1
+    if pos == 1
+        nLong += 1
+    else
+        nShort += 1
+    if pnl > 0
+        nWins    += 1
+        grossWin += pnl
+    else
+        grossLoss += -pnl
+    totalPts += pnl
+    eqPeak   := math.max(eqPeak, totalPts)
+    maxDD    := math.max(maxDD, eqPeak - totalPts)
+    label.new(bar_index, pos == 1 ? high : low,
+         exitReason + " " + (pnl >= 0 ? "+" : "") + str.tostring(pnl, "#.##"),
+         style = pos == 1 ? label.style_label_down : label.style_label_up,
+         color = pnl >= 0 ? color.new(color.teal, 20) : color.new(color.red, 20),
+         textcolor = color.white, size = size.small)
+    pos := 0
+
+// ---------------- 3. Sweep detection + single-candle reversal ----------------
+bool sweepLowNow  = false
+bool sweepHighNow = false
+bool longSignal   = false
+bool shortSignal  = false
+
+if pos == 0 and not tradedToday
+    // -- expire stale sweeps
+    if swLow and bar_index - swLowBar >= revMax
+        swLow := false
+    if swHigh and bar_index - swHighBar >= revMax
+        swHigh := false
+
+    // -- bullish trap: low side liquidity grab inside the Judas window
+    if canLong and inWindow
+        float lvl  = na
+        string nm  = ""
+        if usePD and not na(pdl) and pdl <= dayOpen and low < pdl
+            lvl := pdl
+            nm  := "PDL"
+        if useOR and orReady and low < orL and (na(lvl) or orL < lvl)
+            lvl := orL
+            nm  := "ORL"
+        if not na(lvl)
+            swLowExt    := swLow ? math.min(swLowExt, low) : low
+            swLow       := true
+            swLowLvl    := lvl
+            swLowName   := nm
+            swLowBar    := bar_index
+            sweepLowNow := true
+    if swLow
+        swLowExt := math.min(swLowExt, low)
+        if close > open and close > swLowLvl          // green candle closes back above the level
+            longSignal := true
+            pendLong   := true
+            pendStop   := swLowExt - slBuffer
+            pendLvl    := swLowName
+            swLow      := false
+            swHigh     := false
+
+    // -- bearish trap: high side liquidity grab inside the Judas window
+    if canShort and inWindow and not longSignal
+        float lvl  = na
+        string nm  = ""
+        if usePD and not na(pdh) and pdh >= dayOpen and high > pdh
+            lvl := pdh
+            nm  := "PDH"
+        if useOR and orReady and high > orH and (na(lvl) or orH > lvl)
+            lvl := orH
+            nm  := "ORH"
+        if not na(lvl)
+            swHighExt    := swHigh ? math.max(swHighExt, high) : high
+            swHigh       := true
+            swHighLvl    := lvl
+            swHighName   := nm
+            swHighBar    := bar_index
+            sweepHighNow := true
+    if swHigh and not longSignal
+        swHighExt := math.max(swHighExt, high)
+        if close < open and close < swHighLvl         // red candle closes back below the level
+            shortSignal := true
+            pendShort   := true
+            pendStop    := swHighExt + slBuffer
+            pendLvl     := swHighName
+            swHigh      := false
+            swLow       := false
+
+// ---------------- Drawing ----------------
+plot(showLevels ? pdh : na, "PDH", color = color.new(color.red, 30),   style = plot.style_linebr, linewidth = 1)
+plot(showLevels ? pdl : na, "PDL", color = color.new(color.green, 30), style = plot.style_linebr, linewidth = 1)
+plot(showLevels and orReady ? orH : na, "ORH", color = color.new(color.orange, 20), style = plot.style_linebr, linewidth = 1)
+plot(showLevels and orReady ? orL : na, "ORL", color = color.new(color.blue, 20),   style = plot.style_linebr, linewidth = 1)
+
+bgcolor(showWindow and inWindow ? color.new(color.orange, 92) : na, title = "Judas window")
+
+plotshape(sweepLowNow,  "Low sweep",  shape.triangledown, location.belowbar, color.new(color.red, 0),   size = size.tiny, text = "sweep")
+plotshape(sweepHighNow, "High sweep", shape.triangleup,   location.abovebar, color.new(color.red, 0),   size = size.tiny, text = "sweep")
+plotshape(longSignal,  "Long reversal",  shape.circle, location.belowbar, color.new(color.green, 0), size = size.tiny)
+plotshape(shortSignal, "Short reversal", shape.circle, location.abovebar, color.new(color.red, 0),   size = size.tiny)
+
+if longEntry
+    label.new(bar_index, low, "LONG (" + entryLvl + ")\nE " + str.tostring(entryP, "#.##") +
+         "\nSL " + str.tostring(stopP, "#.##") + "\nTP " + str.tostring(tgtP, "#.##"),
+         style = label.style_label_up, color = color.new(color.green, 10), textcolor = color.white, size = size.small)
+if shortEntry
+    label.new(bar_index, high, "SHORT (" + entryLvl + ")\nE " + str.tostring(entryP, "#.##") +
+         "\nSL " + str.tostring(stopP, "#.##") + "\nTP " + str.tostring(tgtP, "#.##"),
+         style = label.style_label_down, color = color.new(color.red, 10), textcolor = color.white, size = size.small)
+
+inTrade = pos != 0 or exitReason != ""
+plot(inTrade ? stopP  : na, "Stop",   color = color.new(color.red, 0),   style = plot.style_linebr, linewidth = 2)
+plot(inTrade ? tgtP   : na, "Target", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 2)
+plot(inTrade ? entryP : na, "Entry",  color = color.new(color.gray, 0),  style = plot.style_linebr, linewidth = 1)
+
+// ---------------- Backtest table ----------------
+var table tbl = table.new(position.top_right, 2, 10, border_width = 1)
+if showStats and barstate.islast
+    winRate = nTrades > 0 ? 100.0 * nWins / nTrades : 0.0
+    avgPts  = nTrades > 0 ? totalPts / nTrades : 0.0
+    pf      = grossLoss > 0 ? grossWin / grossLoss : (grossWin > 0 ? 999 : 0)
+    hdr     = color.new(color.navy, 0)
+    cell    = color.new(color.gray, 80)
+    table.cell(tbl, 0, 0, "Judas Swing backtest", text_color = color.white, bgcolor = hdr)
+    table.cell(tbl, 1, 0, timeframe.period + "m " + (tfMin == 5 ? "" : "(use 5m)"), text_color = color.white, bgcolor = hdr)
+    table.cell(tbl, 0, 1, "Trades",       bgcolor = cell)
+    table.cell(tbl, 1, 1, str.tostring(nTrades) + " (L " + str.tostring(nLong) + " / S " + str.tostring(nShort) + ")", bgcolor = cell)
+    table.cell(tbl, 0, 2, "Win rate",     bgcolor = cell)
+    table.cell(tbl, 1, 2, str.tostring(winRate, "#.#") + "%", bgcolor = cell)
+    table.cell(tbl, 0, 3, "Total points", bgcolor = cell)
+    table.cell(tbl, 1, 3, str.tostring(totalPts, "#.##"), bgcolor = cell, text_color = totalPts >= 0 ? color.green : color.red)
+    table.cell(tbl, 0, 4, "Avg / trade",  bgcolor = cell)
+    table.cell(tbl, 1, 4, str.tostring(avgPts, "#.##"), bgcolor = cell)
+    table.cell(tbl, 0, 5, "Profit factor", bgcolor = cell)
+    table.cell(tbl, 1, 5, str.tostring(pf, "#.##"), bgcolor = cell)
+    table.cell(tbl, 0, 6, "Max drawdown", bgcolor = cell)
+    table.cell(tbl, 1, 6, str.tostring(maxDD, "#.##"), bgcolor = cell)
+    table.cell(tbl, 0, 7, "Target / SL buf", bgcolor = cell)
+    table.cell(tbl, 1, 7, str.tostring(targetPts, "#") + " / " + str.tostring(slBuffer, "#"), bgcolor = cell)
+    table.cell(tbl, 0, 8, "Window / OR",  bgcolor = cell)
+    table.cell(tbl, 1, 8, str.tostring(windowMin) + "m / " + str.tostring(orMin) + "m", bgcolor = cell)
+
+// ---------------- Alerts ----------------
+alertcondition(longSignal,  "Judas Swing LONG setup",  "Judas Swing: bullish reversal candle closed - go LONG at next candle open")
+alertcondition(shortSignal, "Judas Swing SHORT setup", "Judas Swing: bearish reversal candle closed - go SHORT at next candle open")
+alertcondition(exitReason == "TARGET", "Judas Swing target hit", "Judas Swing: target reached")
+alertcondition(exitReason == "STOP",   "Judas Swing stop hit",   "Judas Swing: stop loss hit")
